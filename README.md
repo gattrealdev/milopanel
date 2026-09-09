@@ -1,247 +1,223 @@
 MiloPanel
 
-MiloPanel adalah control panel PHP ringan dan mandiri yang terinspirasi dari alur kerja Pterodactyl. MiloPanel dirancang untuk menjalankan dan mengelola berbagai aplikasi/server tanpa membutuhkan Docker, Wings, MariaDB, Redis, atau systemd.
+PHP control panel ringan untuk menjalankan dan mengelola aplikasi Linux — tanpa Docker, Wings, database server, atau systemd.
 
-«Dibuat oleh: MiloDev»
+MiloPanel dibuat untuk kebutuhan sederhana: menjalankan beberapa aplikasi dari satu web panel tanpa harus memasang stack control panel yang besar.
+
+Cocok untuk VPS kecil, Linux, Termux, dan environment development/testing.
+
+<p align="center">
+  <a href="https://github.com/gattrealdev/milopanel">
+    <img src="https://img.shields.io/badge/GitHub-gattrealdev%2Fmilopanel-181717?style=flat-square&logo=github" alt="GitHub">
+  </a>
+  <img src="https://img.shields.io/badge/PHP-8.1%2B-777BB4?style=flat-square&logo=php&logoColor=white" alt="PHP">
+  <img src="https://img.shields.io/badge/Linux-Termux-black?style=flat-square&logo=linux" alt="Linux / Termux">
+</p>---
+
+Tentang
+
+MiloPanel adalah control panel sederhana berbasis PHP untuk mengelola proses aplikasi di Linux.
+
+Panel menyediakan interface web untuk:
+
+- membuat dan menghapus server
+- menjalankan proses
+- menghentikan proses
+- restart proses
+- melihat status dan PID
+- melihat log
+- mengelola file
+- mengatur autostart
+- melihat informasi host
+
+Tidak ada Docker atau daemon tambahan yang diperlukan.
+
+Command dijalankan langsung oleh sistem operasi menggunakan user yang menjalankan MiloPanel.
+
+«Penting: MiloPanel bukan container manager dan bukan pengganti Pterodactyl untuk kebutuhan isolation atau hosting multi-user.»
 
 ---
 
-Daftar Isi
+Kenapa MiloPanel?
 
-- "Tentang MiloPanel" (#tentang-milopanel)
-- "Fitur" (#fitur)
-- "Persyaratan" (#persyaratan)
-- "Struktur Direktori" (#struktur-direktori)
-- "Instalasi" (#instalasi)
-- "Menjalankan MiloPanel" (#menjalankan-milopanel)
-- "Menggunakan start.sh" (#menggunakan-startsh)
-- "Akses dari Internet" (#akses-dari-internet)
-- "Login dan Instalasi Pertama" (#login-dan-instalasi-pertama)
-- "Membuat Server" (#membuat-server)
-- "Contoh Command Server" (#contoh-command-server)
-- "Autostart" (#autostart)
-- "File Manager" (#file-manager)
-- "Log Server" (#log-server)
-- "API Endpoint" (#api-endpoint)
-- "Menjalankan di VPS" (#menjalankan-di-vps)
-- "Menjalankan di Termux" (#menjalankan-di-termux)
-- "Menjalankan dengan Background Mode" (#menjalankan-dengan-background-mode)
-- "Domain dan HTTPS" (#domain-dan-https)
-- "Troubleshooting" (#troubleshooting)
-- "Perbedaan dengan Pterodactyl" (#perbedaan-dengan-pterodactyl)
-- "Keamanan" (#keamanan)
-- "Lisensi" (#lisensi)
+Kalau kebutuhanmu cuma menjalankan beberapa aplikasi di VPS atau Termux, memasang Docker + Wings + database + service tambahan bisa terasa berlebihan.
 
----
+MiloPanel mengambil pendekatan yang lebih sederhana:
 
-Tentang MiloPanel
+Browser
+   │
+   ▼
+MiloPanel
+   │
+   ├── Node.js
+   ├── Python
+   ├── PHP
+   ├── Java
+   ├── Bot
+   └── Shell Script
 
-MiloPanel adalah panel manajemen server berbasis PHP yang dibuat untuk lingkungan yang membutuhkan panel sederhana, ringan, dan mudah dijalankan.
-
-MiloPanel dapat digunakan untuk mengelola aplikasi seperti:
-
-- Node.js
-- Python
-- PHP
-- Java
-- server game
-- bot
-- aplikasi CLI
-- dan program Linux lainnya
-
-Panel menjalankan proses menggunakan user sistem yang menjalankan PHP.
-
-MiloPanel bukan container manager. Oleh karena itu, proses yang dijalankan panel mempunyai permission sesuai dengan user OS yang menjalankan panel.
+Semua proses berjalan langsung di environment Linux.
 
 ---
 
 Fitur
 
-Dashboard
+Server
 
-MiloPanel menyediakan dashboard untuk melihat informasi server secara terpusat.
+Setiap server memiliki:
 
-Informasi yang tersedia antara lain:
-
-- status server
-- PID proses
-- penggunaan resource
-- informasi PHP
-- informasi platform
-- load average
-- RAM
-- disk
-
-Manajemen Server
-
-Setiap server dapat mempunyai:
-
-- nama server
-- working directory
-- command
-- konfigurasi autostart
-- status proses
-- PID
-
-Operasi yang tersedia:
-
-- Start
-- Stop
-- Restart
+- Nama
+- Working directory
+- Command
 - Status
+- PID
+- Autostart
 
-Live Logs
+Operasi:
 
-MiloPanel dapat menampilkan log proses secara langsung sehingga lebih mudah melakukan debugging aplikasi.
+Start
+Stop
+Restart
+Status
 
-File Manager
+Live Log
 
-File manager memungkinkan kamu untuk:
+Output proses dapat disimpan ke:
 
-- melihat file
-- membuat file
-- mengedit file teks
-- membuat folder
-- menghapus file/folder
-
-MiloPanel juga mempunyai perlindungan terhadap path traversal.
-
-SQLite Otomatis
-
-MiloPanel tidak membutuhkan instalasi database server.
-
-Konfigurasi dan data panel disimpan secara lokal.
-
-JSON API
-
-MiloPanel menyediakan endpoint JSON untuk beberapa informasi seperti:
-
-- server
-- status
-- log
-- host telemetry
-
-Ringan
-
-MiloPanel tidak membutuhkan:
-
-- Docker
-- Pterodactyl Wings
-- MariaDB
-- Redis
-- Composer
-- Node.js untuk menjalankan panel
-- systemd
-
----
-
-Persyaratan
-
-Minimal:
-
-- PHP 8.1 atau lebih baru
-- Linux / Termux
-- POSIX shell ("sh") untuk menjalankan proses
-- "curl" disarankan untuk mendeteksi IP publik melalui "start.sh"
-
-Untuk VPS Ubuntu/Debian:
-
-sudo apt update
-sudo apt install php php-cli curl git -y
-
-Periksa versi PHP:
-
-php -v
+logs/<server>.log
 
 Contoh:
 
-PHP 8.3.x
+tail -f logs/my-node-app.log
+
+File Manager
+
+Mendukung operasi dasar:
+
+- membuat file
+- membuat folder
+- membaca file
+- mengedit file
+- menghapus file
+- menghapus folder
+
+File Manager juga memiliki validasi path untuk mencegah akses keluar dari direktori yang diizinkan.
+
+Host Information
+
+Dashboard dapat menampilkan informasi seperti:
+
+- PHP version
+- OS/platform
+- RAM
+- Disk
+- Load average
+- status proses
+- PID
+
+JSON API
+
+Beberapa informasi panel tersedia melalui endpoint JSON.
+
+Endpoint dapat berubah antar versi. Lihat source code versi yang sedang digunakan untuk daftar route API.
 
 ---
 
-Struktur Direktori
+Dependency
 
-Setelah MiloPanel dijalankan dan diinisialisasi, beberapa direktori akan dibuat secara otomatis:
+MiloPanel sengaja dibuat dengan dependency minimum.
 
-milopanel/
-├── data/
-│   ├── settings.json
-│   └── servers.json
-│
-├── servers/
-│   └── <server-slug>/
-│
-├── logs/
-│   └── <server-slug>.log
-│
-├── start.sh
-├── router.php
-└── index.php
-
-"data/settings.json"
-
-Menyimpan konfigurasi panel.
-
-"data/servers.json"
-
-Menyimpan konfigurasi server yang dikelola MiloPanel.
-
-"servers/"
-
-Berisi working directory server yang dibuat melalui panel.
-
-"logs/"
-
-Berisi log masing-masing server.
+Komponen| Kebutuhan
+PHP| 8.1+
+PHP CLI| Ya
+Linux| Ya
+Shell| "sh"
+Git| Untuk instalasi/update
+Curl| Disarankan
+Docker| Tidak
+Wings| Tidak
+MariaDB| Tidak
+Redis| Tidak
+Composer| Tidak
+Node.js| Tidak untuk panel
 
 ---
 
 Instalasi
 
-1. Clone Repository
-
-Clone repository MiloPanel:
-
-git clone https://github.com/gattrealdev/milopanel.git
-
-Masuk ke direktori:
-
-cd milopanel
-
----
-
-2. Pastikan PHP Terinstall
-
-Cek:
-
-php -v
-
-Jika belum terinstall di Ubuntu/Debian:
+Ubuntu / Debian
 
 sudo apt update
-sudo apt install php php-cli -y
+sudo apt install php php-cli git curl -y
 
-Kemudian cek kembali:
+Cek PHP:
 
 php -v
 
----
+Kemudian clone repository:
 
-3. Berikan Permission start.sh
+git clone https://github.com/gattrealdev/milopanel.git
+cd milopanel
 
-Jika repository memiliki "start.sh":
+Beri permission pada script:
 
 chmod +x start.sh
 
 ---
 
-Menjalankan MiloPanel
+Instalasi di Termux
 
-Ada dua cara menjalankan MiloPanel.
+MiloPanel juga dapat dijalankan langsung di Termux tanpa root.
 
-Cara 1 — PHP Built-in Server
+Update package:
+
+pkg update
+pkg upgrade
+
+Install kebutuhan dasar:
+
+pkg install php git curl -y
+
+Clone repository:
+
+git clone https://github.com/gattrealdev/milopanel.git
+cd milopanel
 
 Jalankan:
+
+bash start.sh
+
+Atau:
+
+./start.sh
+
+Untuk akses dari HP yang sama:
+
+http://127.0.0.1:8080
+
+---
+
+Menjalankan MiloPanel
+
+Menggunakan "start.sh"
+
+Cara paling mudah:
+
+bash start.sh
+
+Script akan menjalankan server PHP dan menampilkan informasi akses.
+
+Port default dapat digunakan langsung:
+
+http://127.0.0.1:8080
+
+Untuk VPS:
+
+http://IP-VPS:8080
+
+Menggunakan PHP secara langsung
+
+Kalau tidak ingin menggunakan script:
 
 php -S 0.0.0.0:8080 router.php
 
@@ -249,130 +225,52 @@ Kemudian buka:
 
 http://IP-VPS:8080
 
-Contoh:
-
-http://123.123.123.123:8080
-
-Untuk penggunaan lokal:
-
-http://127.0.0.1:8080
-
----
-
-Menggunakan start.sh
-
-Cara yang direkomendasikan adalah menggunakan:
-
-bash start.sh
-
-atau jika sudah executable:
-
-./start.sh
-
-"start.sh" dapat digunakan untuk:
-
-- mendeteksi IP publik VPS
-- menentukan port
-- mengecek apakah port sedang digunakan
-- menjalankan MiloPanel
-- menampilkan alamat akses panel
-
-Contoh output:
-
-╔════════════════════════════════════╗
-║          MILO PANEL                ║
-╚════════════════════════════════════╝
-
-[+] Public IP : 123.123.123.123
-[+] Port      : 8080
-[+] Starting  : http://123.123.123.123:8080
-
-[+] MiloPanel berjalan...
-
-Kemudian akses:
-
-http://123.123.123.123:8080
-
 ---
 
 Mengubah Port
 
-Port default dapat diatur melalui environment variable.
-
-Contoh menggunakan port "9000":
+Port dapat ditentukan melalui environment variable:
 
 PORT=9000 bash start.sh
 
-Kemudian panel dapat diakses melalui:
+Kemudian panel tersedia di:
 
 http://IP-VPS:9000
 
-Jika "start.sh" menggunakan konfigurasi default "8080", cukup jalankan:
+Atau jalankan PHP secara manual:
 
-bash start.sh
-
----
-
-Akses dari Internet
-
-Jika MiloPanel dijalankan di VPS:
-
-php -S 0.0.0.0:8080 router.php
-
-maka server akan listen pada semua interface IPv4.
-
-Namun, port tersebut tetap harus diizinkan oleh firewall VPS.
-
-UFW
-
-Cek status:
-
-sudo ufw status
-
-Buka port "8080":
-
-sudo ufw allow 8080/tcp
-
-Kemudian:
-
-sudo ufw reload
-
-Jika provider VPS memiliki firewall/security group sendiri, port tersebut juga harus dibuka dari dashboard provider.
+php -S 0.0.0.0:9000 router.php
 
 ---
 
-Login dan Instalasi Pertama
+Login Pertama
 
-Pada akses pertama, MiloPanel akan menampilkan proses instalasi awal.
+Saat pertama kali dibuka, MiloPanel akan menjalankan setup awal.
 
-Buat password administrator.
+Ikuti halaman instalasi untuk membuat akun/password administrator.
 
-Setelah instalasi selesai, MiloPanel akan membuat data seperti:
+Konfigurasi panel akan disimpan di:
 
-data/settings.json
-data/servers.json
-servers/
-logs/
+data/
+├── settings.json
+└── servers.json
 
-Jangan menghapus "data/settings.json" atau "data/servers.json" jika masih membutuhkan konfigurasi panel.
+Jangan menghapus "data/" jika konfigurasi masih diperlukan.
 
 ---
 
 Membuat Server
 
-Setelah login ke dashboard:
+Setelah login, buat server baru dan tentukan:
 
-1. Buka dashboard MiloPanel.
-2. Pilih menu untuk membuat server.
-3. Masukkan nama server.
-4. Tentukan working directory.
-5. Masukkan command yang ingin dijalankan.
-6. Atur autostart jika diperlukan.
-7. Simpan konfigurasi.
+Name
+Working Directory
+Command
+Autostart
 
-Contoh server Node.js:
+Contoh aplikasi Node.js:
 
-Nama:
+Name:
 My Node App
 
 Working Directory:
@@ -381,9 +279,17 @@ servers/my-node-app
 Command:
 node app.js
 
+Strukturnya dapat terlihat seperti:
+
+servers/
+└── my-node-app/
+    ├── app.js
+    ├── package.json
+    └── node_modules/
+
 ---
 
-Contoh Command Server
+Contoh Command
 
 Node.js
 
@@ -409,157 +315,93 @@ Java
 
 java -Xmx1G -jar server.jar
 
-Shell Script
+Shell
 
 bash start.sh
 
----
-
-Autostart
-
-MiloPanel dapat menyimpan konfigurasi autostart untuk server yang dikelola.
-
-Autostart berguna ketika kamu ingin proses tertentu dijalankan secara otomatis sesuai mekanisme yang disediakan panel.
-
-Perlu diperhatikan bahwa autostart server di MiloPanel tidak sama dengan systemd service.
-
-Untuk kebutuhan production yang sangat penting, gunakan supervisor/service manager yang sesuai dengan sistem operasi.
+MiloPanel pada dasarnya dapat menjalankan command yang tersedia pada environment Linux tersebut.
 
 ---
 
-File Manager
+Struktur Direktori
 
-File Manager MiloPanel digunakan untuk mengelola file di dalam working directory server.
+Struktur utama:
 
-Fitur yang tersedia dapat mencakup:
+milopanel/
+├── data/
+│   ├── settings.json
+│   └── servers.json
+│
+├── servers/
+│   └── <server-directory>/
+│
+├── logs/
+│   └── <server>.log
+│
+├── start.sh
+├── router.php
+├── index.php
+└── README.md
 
-- membuat file
-- membuat folder
-- membaca file
-- mengedit file
-- menghapus file/folder
+"data/"
 
-Contoh struktur:
+Menyimpan konfigurasi MiloPanel.
 
-servers/
-└── my-node-app/
-    ├── app.js
-    ├── package.json
-    ├── .env
-    └── public/
+"servers/"
 
-Hindari menyimpan secret penting di file yang dapat diakses pengguna yang tidak dipercaya.
+Working directory aplikasi yang dikelola panel.
+
+"logs/"
+
+Log output proses.
 
 ---
 
-Log Server
+Log
 
-Setiap server memiliki file log.
+Log server berada di:
+
+logs/
 
 Contoh:
 
 logs/my-node-app.log
 
-Untuk melihat log melalui terminal:
+Lihat log:
 
 tail -f logs/my-node-app.log
 
-Untuk melihat beberapa baris terakhir:
+100 baris terakhir:
 
 tail -n 100 logs/my-node-app.log
 
 ---
 
-API Endpoint
+Autostart
 
-MiloPanel menyediakan endpoint JSON untuk beberapa fungsi panel.
+MiloPanel dapat menyimpan konfigurasi autostart untuk server.
 
-Endpoint yang tersedia bergantung pada implementasi versi MiloPanel yang sedang digunakan.
+Fitur ini berguna ketika aplikasi perlu dijalankan kembali melalui mekanisme panel.
 
-Secara umum API digunakan untuk mengambil informasi seperti:
+Namun, autostart panel bukan pengganti process manager.
 
-- daftar server
-- status server
-- log server
-- informasi host
+Untuk service production yang membutuhkan reliability tinggi, gunakan process manager yang sesuai dengan environment, misalnya:
 
-Jika ingin melihat endpoint yang tersedia pada versi yang sedang digunakan, periksa source code route/API pada repository.
-
----
-
-Menjalankan di VPS
-
-Berikut contoh instalasi pada Ubuntu.
-
-1. Update Sistem
-
-sudo apt update
-sudo apt upgrade -y
-
-2. Install Dependency
-
-sudo apt install git curl php php-cli -y
-
-3. Clone MiloPanel
-
-git clone https://github.com/gattrealdev/milopanel.git
-
-4. Masuk Direktori
-
-cd milopanel
-
-5. Jalankan
-
-bash start.sh
-
-Jika berhasil, akan muncul alamat seperti:
-
-[+] Public IP : 123.123.123.123
-[+] Port      : 8080
-[+] Starting  : http://123.123.123.123:8080
-
-Buka alamat tersebut dari browser.
+systemd
+Supervisor
+PM2
 
 ---
 
-Menjalankan di Termux
+Menjalankan di Background
 
-Update package:
-
-pkg update
-pkg upgrade
-
-Install PHP:
-
-pkg install php curl git -y
-
-Clone repository:
-
-git clone https://github.com/gattrealdev/milopanel.git
-
-Masuk:
-
-cd milopanel
-
-Jalankan:
-
-bash start.sh
-
-Atau secara manual:
+Jika MiloPanel dijalankan melalui SSH:
 
 php -S 0.0.0.0:8080 router.php
 
----
+proses dapat berhenti ketika session SSH berakhir.
 
-Menjalankan dengan Background Mode
-
-Jika MiloPanel dijalankan langsung di SSH:
-
-php -S 0.0.0.0:8080 router.php
-
-kemudian terminal/SSH ditutup, proses dapat ikut berhenti.
-
-Untuk menjalankan proses di background:
+Cara sederhana menggunakan "nohup":
 
 nohup php -S 0.0.0.0:8080 router.php > milopanel.log 2>&1 &
 
@@ -571,97 +413,99 @@ Lihat log:
 
 tail -f milopanel.log
 
-Dengan metode ini, proses tidak bergantung langsung pada terminal interaktif.
+Di Termux, alternatif yang lebih cocok untuk proses yang ingin tetap berjalan setelah aplikasi Termux ditutup adalah menggunakan session manager seperti "tmux".
+
+Install:
+
+pkg install tmux
+
+Buat session:
+
+tmux new -s milopanel
+
+Jalankan panel:
+
+php -S 0.0.0.0:8080 router.php
+
+Detach dengan:
+
+CTRL + B
+kemudian D
+
+Masuk kembali:
+
+tmux attach -t milopanel
 
 ---
 
-Domain dan HTTPS
+Akses dari Internet
 
-Untuk production, disarankan menggunakan:
+Untuk VPS, jalankan MiloPanel pada:
+
+php -S 0.0.0.0:8080 router.php
+
+Pastikan port firewall terbuka.
+
+Jika menggunakan UFW:
+
+sudo ufw allow 8080/tcp
+sudo ufw status
+
+Kemudian akses:
+
+http://IP-VPS:8080
+
+Jika provider VPS memiliki firewall/security group sendiri, port tersebut juga harus diizinkan di dashboard provider.
+
+Termux
+
+Secara default, Termux lebih cocok untuk akses lokal:
+
+http://127.0.0.1:8080
+
+Jika ingin mengakses Termux dari perangkat lain, pastikan perangkat berada pada jaringan yang sama dan server listen pada:
+
+0.0.0.0
+
+---
+
+Domain & HTTPS
+
+Untuk VPS, MiloPanel dapat ditempatkan di belakang reverse proxy.
+
+Contoh:
 
 Internet
    │
    ▼
-Domain
+panel.example.com
    │
    ▼
 Nginx
    │
    ▼
-MiloPanel
+127.0.0.1:8080
    │
    ▼
-PHP
+MiloPanel
 
-Contoh:
-
-panel.example.com
-
-bukan:
-
-http://123.123.123.123:8080
-
-DNS
-
-Buat record DNS:
-
-Type: A
-Name: panel
-Value: IP-VPS
-
-Sehingga:
-
-panel.example.com
-
-mengarah ke IP VPS.
-
-Reverse Proxy
-
-Nginx dapat digunakan sebagai reverse proxy menuju MiloPanel yang berjalan pada port internal, misalnya:
+MiloPanel tetap berjalan di:
 
 127.0.0.1:8080
 
-Dengan demikian pengguna cukup mengakses:
+Nginx menangani koneksi dari internet dan HTTPS.
 
-https://panel.example.com
-
-tanpa harus mengetik port "8080".
+Untuk penggunaan publik, jangan mengandalkan PHP built-in server sebagai server web production utama.
 
 ---
 
-Troubleshooting
+Firewall
 
-Port sudah digunakan
-
-Jika muncul pesan bahwa port sudah digunakan, cek:
-
-ss -ltnp | grep :8080
-
-atau:
-
-lsof -i :8080
-
-Kemudian gunakan port lain:
-
-PORT=9000 bash start.sh
-
----
-
-Tidak bisa diakses dari Internet
-
-Pastikan MiloPanel listen pada:
-
-0.0.0.0
-
-bukan:
-
-127.0.0.1
-
-Cek:
+Cek port:
 
 ss -ltnp | grep 8080
 
-Kemudian periksa firewall:
+Cek UFW:
 
 sudo ufw status
 
@@ -669,16 +513,22 @@ Buka port:
 
 sudo ufw allow 8080/tcp
 
-Jangan lupa periksa firewall/security group dari provider VPS.
+Jika port tetap tidak dapat diakses, periksa firewall/security group VPS.
 
 ---
 
+Troubleshooting
+
 "php: command not found"
 
-Install PHP:
+Ubuntu/Debian:
 
 sudo apt update
 sudo apt install php php-cli -y
+
+Termux:
+
+pkg install php -y
 
 Cek:
 
@@ -696,75 +546,74 @@ Kemudian:
 
 ./start.sh
 
-Atau tanpa mengubah permission:
+Atau:
 
 bash start.sh
 
 ---
 
-Panel mati setelah SSH ditutup
+Port sudah digunakan
 
-Jika menjalankan:
+Cek:
 
-php -S 0.0.0.0:8080 router.php
+ss -ltnp | grep :8080
 
-langsung dari SSH, proses dapat berhenti ketika session berakhir.
+Jika tersedia, gunakan port lain:
 
-Gunakan:
-
-nohup php -S 0.0.0.0:8080 router.php > milopanel.log 2>&1 &
-
-atau gunakan process manager seperti "systemd", "supervisord", atau solusi lain yang sesuai dengan environment VPS.
+PORT=9000 bash start.sh
 
 ---
 
-Perbedaan dengan Pterodactyl
+Tidak bisa diakses dari internet
 
-MiloPanel bukan pengganti penuh Pterodactyl + Wings.
+Pastikan server dijalankan menggunakan:
 
-Perbedaan utama:
+0.0.0.0
 
-Fitur| MiloPanel| Pterodactyl
-PHP| Ya| Ya
-Docker| Tidak diperlukan| Ya
-Wings| Tidak| Ya
-MariaDB| Tidak diperlukan| Umumnya digunakan
-Redis| Tidak diperlukan| Digunakan untuk fitur tertentu
-Container isolation| Tidak| Ya
-cgroups| Tidak| Ya
-Root daemon| Tidak diperlukan| Wings membutuhkan konfigurasi sistem
-Cocok untuk Termux/Proot| Ya| Tidak ideal
-Ringan| Ya| Lebih kompleks
-File Manager| Ya| Ya
-Server start/stop| Ya| Ya
-Live log| Ya| Ya
+bukan:
 
-MiloPanel sengaja menggunakan arsitektur yang lebih sederhana agar dapat dijalankan pada environment terbatas seperti:
+127.0.0.1
 
-- VPS kecil
-- Linux biasa
-- Termux
-- Proot
-- environment tanpa Docker
-- environment tanpa systemd
+Cek:
+
+ss -ltnp | grep 8080
+
+Kemudian periksa:
+
+sudo ufw status
+
+dan firewall/security group dari provider VPS.
+
+---
+
+Panel mati setelah SSH ditutup
+
+Gunakan "nohup":
+
+nohup php -S 0.0.0.0:8080 router.php > milopanel.log 2>&1 &
+
+atau process manager.
+
+Untuk Termux, "tmux" dapat digunakan:
+
+pkg install tmux
+tmux new -s milopanel
 
 ---
 
 Keamanan
 
-MiloPanel menjalankan command sebagai user OS yang menjalankan PHP.
+MiloPanel menjalankan command menggunakan permission user OS yang menjalankan PHP.
 
-Artinya, jika PHP dijalankan sebagai:
-
-root
-
-maka command server juga berpotensi berjalan sebagai:
+Misalnya PHP dijalankan sebagai:
 
 root
 
-Ini memiliki risiko keamanan yang tinggi.
+maka command server juga dapat memiliki permission root.
 
-Untuk production, sebaiknya jalankan MiloPanel menggunakan user Linux khusus yang memiliki permission seminimal mungkin.
+Jangan menjalankan MiloPanel sebagai root jika tidak diperlukan.
+
+Gunakan user Linux khusus untuk panel dan aplikasi.
 
 Contoh:
 
@@ -774,52 +623,32 @@ bukan:
 
 root
 
-Jangan memberikan akses root kepada pengguna yang tidak dipercaya.
+MiloPanel juga tidak memberikan container isolation.
 
-MiloPanel juga tidak menyediakan sandbox seperti container Docker.
+Tidak ada:
 
-Jika sebuah server menjalankan command berbahaya, command tersebut mempunyai akses sesuai permission user OS yang menjalankannya.
+- Docker isolation
+- cgroups resource isolation
+- namespace isolation
+- sandbox VM
 
----
-
-Catatan Production
-
-PHP built-in server sangat praktis untuk development, testing, VPS kecil, dan penggunaan internal.
-
-Untuk deployment production yang serius, disarankan menggunakan:
-
-Nginx
-   ↓
-PHP / Application
-   ↓
-MiloPanel
-
-serta process manager yang sesuai untuk memastikan service dapat restart secara otomatis.
-
-Pastikan juga:
-
-- gunakan HTTPS
-- gunakan password administrator yang kuat
-- batasi permission filesystem
-- jangan menjalankan panel sebagai root jika tidak diperlukan
-- buka hanya port yang diperlukan
-- lakukan backup direktori "data/"
-- jangan mengekspos file konfigurasi/secret
-- gunakan firewall
+Karena itu, jangan memberikan akses panel kepada user yang tidak dipercaya.
 
 ---
 
 Backup
 
-Data penting MiloPanel berada pada direktori:
+Data utama:
 
 data/
+servers/
+logs/
 
-Backup sederhana:
+Backup:
 
 tar -czf milopanel-backup.tar.gz data/ servers/ logs/
 
-Untuk melihat file backup:
+Cek:
 
 ls -lh milopanel-backup.tar.gz
 
@@ -827,42 +656,112 @@ Restore:
 
 tar -xzf milopanel-backup.tar.gz
 
+Sebelum melakukan update besar, backup terlebih dahulu.
+
 ---
 
-Update MiloPanel
+Update
 
-Sebelum update, backup data terlebih dahulu.
+Masuk ke directory:
+
+cd milopanel
+
+Backup:
 
 tar -czf backup.tar.gz data/ servers/ logs/
 
-Kemudian:
+Update source:
 
 git pull
 
-Setelah update selesai:
+Kemudian jalankan kembali:
 
 bash start.sh
 
-Jika terdapat perubahan konfigurasi atau struktur data pada versi baru, ikuti catatan release dari repository.
+Jika update mengubah struktur konfigurasi, ikuti perubahan yang tercantum pada repository/release terkait.
 
 ---
 
-Lisensi
+MiloPanel vs Pterodactyl
 
-Silakan lihat file "LICENSE" pada repository untuk informasi lisensi dan ketentuan penggunaan.
+MiloPanel dan Pterodactyl memiliki target penggunaan yang berbeda.
+
+Fitur| MiloPanel| Pterodactyl
+PHP Panel| ✓| ✓
+Docker| —| ✓
+Wings| —| ✓
+Database server| —| ✓
+Container isolation| —| ✓
+File Manager| ✓| ✓
+Start / Stop| ✓| ✓
+Log| ✓| ✓
+Termux| ✓| —
+Proot| ✓| —
+Dependency minimal| ✓| —
+Multi-user hosting| Dasar| ✓
+Resource isolation| —| ✓
+
+Gunakan MiloPanel jika
+
+- membutuhkan panel sederhana
+- menjalankan bot
+- menjalankan aplikasi Node.js/Python/PHP
+- menggunakan VPS kecil
+- menggunakan Termux
+- menggunakan Proot
+- tidak ingin memasang Docker
+- hanya membutuhkan process management dasar
+
+Gunakan Pterodactyl jika
+
+- membutuhkan container isolation
+- membuat layanan game hosting
+- membutuhkan resource limit yang lebih kompleks
+- membutuhkan multi-user hosting
+- membutuhkan infrastruktur production yang lebih lengkap
 
 ---
 
-Kredit
+Batasan
 
-MiloPanel
+MiloPanel sengaja dibuat sederhana. Karena itu, beberapa kemampuan control panel besar memang tidak menjadi bagian dari project ini.
 
-Dibuat oleh:
+MiloPanel tidak ditujukan sebagai:
+
+- container platform
+- virtualization platform
+- replacement Docker
+- replacement Kubernetes
+- game hosting platform skala besar
+- security sandbox
+
+Tujuannya lebih sederhana:
+
+«Menjalankan dan mengelola proses Linux dari web panel dengan dependency seminimal mungkin.»
+
+---
+
+License
+
+Lihat file ""LICENSE"" (LICENSE) untuk informasi lisensi dan ketentuan penggunaan.
+
+---
+
+Author
 
 MiloDev
 
+GitHub:
+
+"@gattrealdev" (https://github.com/gattrealdev)
+
 Repository:
 
-https://github.com/gattrealdev/milopanel
+"gattrealdev/milopanel" (https://github.com/gattrealdev/milopanel)
 
-Terima kasih telah menggunakan MiloPanel.
+---
+
+<p align="center">
+  <b>MiloPanel</b><br>
+  Simple process management for Linux & Termux.
+</p>
