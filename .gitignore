@@ -1,0 +1,5 @@
+data/*.sqlite*
+logs/*.log
+logs/*.pid
+servers/*
+!servers/.gitkeep

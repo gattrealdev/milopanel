@@ -1,0 +1,274 @@
+<?php
+declare(strict_types=1);
+
+// MiloPanel — standalone PHP game/application server panel.
+// Requirements: PHP 8.1+. POSIX shell is used for Linux/Termux process controls.
+// No Composer, Node, MySQL, Redis, Docker, or systemd required.
+
+session_name('milopanel');
+session_start();
+
+const APP_NAME = 'MiloPanel';
+const STORAGE_DIR = __DIR__ . '/servers';
+const LOG_DIR = __DIR__ . '/logs';
+const MAX_LOG_BYTES = 1024 * 1024 * 4;
+
+@mkdir(__DIR__ . '/data', 0775, true);
+@mkdir(STORAGE_DIR, 0775, true);
+@mkdir(LOG_DIR, 0775, true);
+
+function store_read(string $file, array $default=[]): array {
+    if (!is_file($file)) return $default;
+    $raw = @file_get_contents($file);
+    if ($raw === false || trim($raw)==='') return $default;
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : $default;
+}
+function store_write(string $file, array $data): void {
+    $tmp = $file.'.tmp';
+    file_put_contents($tmp, json_encode($data, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES), LOCK_EX);
+    rename($tmp, $file);
+}
+function settings(): array { static $x=null; if($x===null){$x=store_read(__DIR__.'/data/settings.json',[]);} return $x; }
+function save_settings(array $x): void { store_write(__DIR__.'/data/settings.json',$x); }
+function servers_store(): array { static $x=null; if($x===null){$x=store_read(__DIR__.'/data/servers.json',[]);} return $x; }
+function save_servers_store(array $x): void { store_write(__DIR__.'/data/servers.json',$x); }
+
+function setting(string $key, ?string $default = null): ?string {
+    $x=settings(); return array_key_exists($key,$x) ? (string)$x[$key] : $default;
+}
+function set_setting(string $key, string $value): void {
+    $x=settings(); $x[$key]=$value; save_settings($x);
+}
+
+function is_installed(): bool { return setting('admin_hash') !== null; }
+function logged_in(): bool { return isset($_SESSION['uid']) && $_SESSION['uid'] === 'admin'; }
+function csrf(): string { if (!isset($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(24)); return $_SESSION['csrf']; }
+function check_csrf(): void { if (!hash_equals((string)($_SESSION['csrf'] ?? ''), (string)($_POST['csrf'] ?? ''))) fail('Invalid CSRF token', 403); }
+function fail(string $msg, int $code=400): never { http_response_code($code); if (wants_json()) { header('Content-Type: application/json'); echo json_encode(['ok'=>false,'error'=>$msg], JSON_UNESCAPED_SLASHES); exit; } echo '<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;padding:40px;background:#0b1020;color:#fff"><h2>Request failed</h2><p>'.h($msg).'</p><p><a style="color:#8ab4ff" href="./">Back</a></p></body>'; exit; }
+function wants_json(): bool { return isset($_GET['api']) || str_starts_with($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json'); }
+function json_out(array $data): never { header('Content-Type: application/json; charset=utf-8'); echo json_encode($data, JSON_UNESCAPED_SLASHES); exit; }
+function h(string $s): string { return htmlspecialchars($s, ENT_QUOTES, 'UTF-8'); }
+function now(): string { return date('c'); }
+function slug(string $s): string { $s = strtolower(trim($s)); $s = preg_replace('/[^a-z0-9]+/', '-', $s) ?? ''; return trim($s, '-') ?: 'server'; }
+function all_servers(): array { return array_values(servers_store()); }
+function save_server(array $s): void { $x=servers_store(); $x[(string)$s['id']]=$s; save_servers_store($x); }
+function server_row(int $id): array { $x=servers_store(); $s=$x[(string)$id]??null; if(!$s) fail('Server not found',404); return $s; }
+
+function server_dir(array $s): string { return STORAGE_DIR . '/' . $s['slug']; }
+function log_file(array $s): string { return LOG_DIR . '/' . $s['slug'] . '.log'; }
+function pid_file(array $s): string { return LOG_DIR . '/' . $s['slug'] . '.pid'; }
+function proc_pid(array $s): ?int {
+    $f=pid_file($s); if (!is_file($f)) return null; $p=(int)trim((string)@file_get_contents($f)); return $p>0 ? $p : null;
+}
+function process_alive(?int $pid): bool {
+    if (!$pid) return false;
+    if (DIRECTORY_SEPARATOR === '\\') { @exec('tasklist /FI "PID eq '.(int)$pid.'" 2>NUL', $o, $rc); return $rc===0 && count($o)>1; }
+    if (function_exists('posix_kill')) return @posix_kill($pid, 0);
+    @exec('kill -0 '.(int)$pid.' 2>/dev/null', $o, $rc); return $rc===0;
+}
+function status_of(array $s): string { return process_alive(proc_pid($s)) ? 'running' : 'offline'; }
+function safe_join(string $base, string $rel): string {
+    $rel = str_replace('\\','/',$rel); $rel = ltrim($rel,'/');
+    if ($rel === '' || $rel === '.') return rtrim($base,'/');
+    foreach (explode('/',$rel) as $part) { if ($part === '..') fail('Path traversal denied',403); }
+    $full = rtrim($base,'/') . '/' . $rel;
+    $realBase = realpath($base);
+    if ($realBase === false) fail('Storage missing',500);
+    $parent = realpath(dirname($full));
+    if ($parent !== false && !str_starts_with($parent, $realBase)) fail('Path outside server root',403);
+    $candidate = $full;
+    if (file_exists($candidate)) { $real=realpath($candidate); if ($real===false || !str_starts_with($real,$realBase)) fail('Path outside server root',403); }
+    return $candidate;
+}
+function tail_log(string $file, int $bytes=12000): string { if (!is_file($file)) return ''; $size=(int)filesize($file); $fh=fopen($file,'rb'); if(!$fh) return ''; fseek($fh, max(0,$size-$bytes)); $txt=stream_get_contents($fh) ?: ''; fclose($fh); return $txt; }
+function shell_start(array $s): void {
+    $dir=server_dir($s); @mkdir($dir,0775,true);
+    $log=log_file($s); @touch($log);
+    if (status_of($s)==='running') return;
+    $cmd=$s['command'];
+    if (DIRECTORY_SEPARATOR === '\\') {
+        $wrapped = 'cd /d "'.str_replace('"','\\"',$dir).'" && '.$cmd.' >> "'.$log.'" 2>&1';
+        pclose(popen('start /B cmd /C "'.$wrapped.'"','r'));
+        sleep(1); // PID lookup on Windows is best-effort below.
+        return;
+    }
+    $cwd = preg_replace("/[\r\n]+/", ' ', $s['cwd']);
+    $cmd = 'cd '.escapeshellarg($cwd).' && exec '.$cmd;
+    $wrapper = 'sh -c '.escapeshellarg($cmd).' >> '.escapeshellarg($log).' 2>&1 & echo $!';
+    $pid = trim((string)shell_exec($wrapper));
+    if ($pid !== '' && ctype_digit($pid)) file_put_contents(pid_file($s), $pid, LOCK_EX);
+}
+function shell_stop(array $s): void {
+    $pid=proc_pid($s); if(!$pid) return;
+    if (DIRECTORY_SEPARATOR === '\\') { @exec('taskkill /PID '.(int)$pid.' /T /F'); }
+    else { @exec('kill -TERM '.(int)$pid.' 2>/dev/null'); usleep(300000); if(process_alive($pid)) @exec('kill -KILL '.(int)$pid.' 2>/dev/null'); }
+    @unlink(pid_file($s));
+}
+function restart_server(array $s): void { shell_stop($s); usleep(250000); shell_start($s); }
+function sysinfo(): array {
+    $load = function_exists('sys_getloadavg') ? sys_getloadavg() : [0,0,0];
+    $free = $total = null;
+    if (is_file('/proc/meminfo')) {
+        $m=file('/proc/meminfo', FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES);
+        foreach($m as $line){ if(preg_match('/^MemTotal:\s+(\d+)/',$line,$x))$total=(int)$x[1]*1024; if(preg_match('/^MemAvailable:\s+(\d+)/',$line,$x))$free=(int)$x[1]*1024; }
+    }
+    $disk = @disk_free_space(__DIR__); $diskTotal=@disk_total_space(__DIR__);
+    return ['php'=>PHP_VERSION,'os'=>PHP_OS_FAMILY,'arch'=>php_uname('m'),'load'=>round((float)$load[0],2),'ram_free'=>$free,'ram_total'=>$total,'disk_free'=>$disk?:null,'disk_total'=>$diskTotal?:null];
+}
+
+// API / actions.
+$action = $_GET['action'] ?? '';
+if ($action === 'install') {
+    if (is_installed()) {
+        header('Location: ./', true, 302);
+        exit;
+    }
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $user = trim((string)($_POST['username'] ?? ''));
+        $pass = (string)($_POST['password'] ?? '');
+
+        if ($user !== 'admin') {
+            fail('Username awal harus admin');
+        }
+
+        if (strlen($pass) < 8) {
+            fail('Password minimal 8 karakter');
+        }
+
+        $dataDir = __DIR__ . '/data';
+        $settingsFile = $dataDir . '/settings.json';
+
+        if (!is_dir($dataDir) && !mkdir($dataDir, 0775, true)) {
+            fail('Tidak bisa membuat folder data', 500);
+        }
+
+        $hash = password_hash($pass, PASSWORD_DEFAULT);
+
+        if ($hash === false) {
+            fail('Gagal membuat password hash', 500);
+        }
+
+        $settings = [
+            'admin_hash' => $hash,
+            'created_at' => now()
+        ];
+
+        $json = json_encode(
+            $settings,
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+        );
+
+        if ($json === false) {
+            fail('Gagal encode settings', 500);
+        }
+
+        $written = file_put_contents(
+            $settingsFile,
+            $json,
+            LOCK_EX
+        );
+
+        if ($written === false) {
+            fail('Gagal menulis data/settings.json', 500);
+        }
+
+        clearstatcache(true, $settingsFile);
+
+        session_regenerate_id(true);
+        $_SESSION['uid'] = 'admin';
+        $_SESSION['csrf'] = bin2hex(random_bytes(24));
+        session_write_close();
+
+        header('Location: ./', true, 302);
+        exit;
+    }
+
+    echo install_page();
+    exit;
+}
+if (!is_installed()) { header('Location: ?action=install'); exit; }
+
+if ($action === 'login' && $_SERVER['REQUEST_METHOD']==='POST') {
+    $p=(string)($_POST['password']??''); if (password_verify($p,(string)setting('admin_hash'))) { $_SESSION['uid']='admin'; csrf(); header('Location: ./'); exit; } fail('Invalid password',401);
+}
+if ($action === 'logout') { session_destroy(); header('Location: ./'); exit; }
+if (!logged_in()) { echo login_page(); exit; }
+
+if ($action === 'create' && $_SERVER['REQUEST_METHOD']==='POST') {
+    check_csrf(); $name=trim((string)($_POST['name']??'')); $cmd=trim((string)($_POST['command']??''));
+    if ($name===''||$cmd==='') fail('Name and command are required');
+    $slug=slug($name); $base=$slug; $n=2; $existing=array_map(fn($x)=>(string)$x['slug'], all_servers()); while(in_array($slug,$existing,true)) $slug=$base.'-'.($n++);
+    $list=servers_store(); $id=1; if($list){$ids=array_map('intval',array_keys($list));$id=max($ids)+1;}
+    $cwd=STORAGE_DIR.'/'.$slug; @mkdir($cwd,0775,true);
+    $server=['id'=>$id,'name'=>$name,'slug'=>$slug,'command'=>$cmd,'cwd'=>$cwd,'autostart'=>!empty($_POST['autostart'])?1:0,'created_at'=>now(),'updated_at'=>now()];
+    $list[(string)$id]=$server; save_servers_store($list);
+    header('Location: ?server='.urlencode($slug)); exit;
+}
+if ($action === 'delete' && $_SERVER['REQUEST_METHOD']==='POST') { check_csrf(); $s=server_row((int)$_POST['id']); shell_stop($s); $list=servers_store(); unset($list[(string)$s['id']]); save_servers_store($list); rrmdir(server_dir($s)); @unlink(log_file($s)); @unlink(pid_file($s)); header('Location: ./'); exit; }
+if ($action === 'toggle' && $_SERVER['REQUEST_METHOD']==='POST') { check_csrf(); $s=server_row((int)$_POST['id']); if(status_of($s)==='running') shell_stop($s); else shell_start($s); header('Location: ?server='.urlencode($s['slug'])); exit; }
+if ($action === 'restart' && $_SERVER['REQUEST_METHOD']==='POST') { check_csrf(); $s=server_row((int)$_POST['id']); restart_server($s); header('Location: ?server='.urlencode($s['slug'])); exit; }
+if ($action === 'save_server' && $_SERVER['REQUEST_METHOD']==='POST') { check_csrf(); $s=server_row((int)$_POST['id']); $name=trim((string)$_POST['name']);$cmd=trim((string)$_POST['command']);$cwd=trim((string)$_POST['cwd']); if($name===''||$cmd===''||$cwd==='') fail('Fields cannot be empty'); $s['name']=$name;$s['command']=$cmd;$s['cwd']=$cwd;$s['autostart']=!empty($_POST['autostart'])?1:0;$s['updated_at']=now();save_server($s); header('Location: ?server='.urlencode($s['slug'])); exit; }
+if ($action === 'file_write' && $_SERVER['REQUEST_METHOD']==='POST') { check_csrf(); $s=server_row((int)$_POST['id']);$rel=(string)$_POST['path'];$content=(string)$_POST['content'];$p=safe_join(server_dir($s),$rel); if(strlen($content)>3_000_000)fail('File too large'); @mkdir(dirname($p),0775,true);file_put_contents($p,$content,LOCK_EX);header('Location: ?server='.urlencode($s['slug']).'&file='.urlencode($rel));exit; }
+if ($action === 'file_delete' && $_SERVER['REQUEST_METHOD']==='POST') { check_csrf(); $s=server_row((int)$_POST['id']);$p=safe_join(server_dir($s),(string)$_POST['path']); if($p===server_dir($s))fail('Cannot delete server root'); if(is_dir($p))rrmdir($p); else @unlink($p); header('Location: ?server='.urlencode($s['slug']));exit; }
+
+if (isset($_GET['api'])) {
+    switch ($_GET['api']) {
+        case 'servers': json_out(['ok'=>true,'servers'=>array_map(function($s){$s['status']=status_of($s);$s['pid']=proc_pid($s);return $s;},array_reverse(all_servers()))]);
+        case 'status': $id=(int)($_GET['id']??0);$s=server_row($id);json_out(['ok'=>true,'server'=>$s,'status'=>status_of($s),'pid'=>proc_pid($s),'log'=>tail_log(log_file($s),16000),'system'=>sysinfo()]);
+        case 'log': $id=(int)($_GET['id']??0);$s=server_row($id);json_out(['ok'=>true,'status'=>status_of($s),'log'=>tail_log(log_file($s),20000)]);
+        case 'system': json_out(['ok'=>true,'system'=>sysinfo()]);
+        default: json_out(['ok'=>false,'error'=>'Unknown API'],404);
+    }
+}
+
+function rrmdir(string $dir): void { if(!is_dir($dir))return; $items=scandir($dir)?:[];foreach($items as $i){if($i==='.'||$i==='..')continue;$p=$dir.'/'.$i;if(is_dir($p)&&!is_link($p))rrmdir($p);else @unlink($p);} @rmdir($dir); }
+
+// Autostart is intentionally tied to the PHP panel process: no systemd/cron is required.
+foreach (all_servers() as $as) { if (!empty($as['autostart']) && status_of($as) !== 'running') { @shell_start($as); } }
+$servers=array_reverse(all_servers());
+$selected=null; $serverSlug=(string)($_GET['server']??''); if($serverSlug!==''){ foreach($servers as $sv){ if($sv['slug']===$serverSlug){$selected=$sv;break;} } }
+if (!$selected && $servers) $selected=$servers[0];
+$fileRel=(string)($_GET['file']??''); $editing='';
+if($selected&&$fileRel!==''){ $p=safe_join(server_dir($selected),$fileRel); if(is_file($p)){ $editing=(string)@file_get_contents($p); } }
+
+function login_page(): string { ob_start(); $csrf=csrf(); ?>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?=h(APP_NAME)?></title><?=css()?></head><body><div class="center"><div class="card auth"><div class="brand">Milo<span>Panel</span></div><p class="muted">Standalone server control panel</p><form method="post" action="?action=login"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><label>Password</label><input class="input" type="password" name="password" autofocus required><button class="btn primary w" type="submit">Sign in</button></form></div></div></body></html><?php return (string)ob_get_clean(); }
+function install_page(): string { ob_start(); $csrf=csrf(); ?>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Install <?=h(APP_NAME)?></title><?=css()?></head><body><div class="center"><div class="card auth"><div class="brand">Milo<span>Panel</span></div><h2>First-run setup</h2><p class="muted">Native JSON storage and server directories are created automatically.</p><form method="post" action="?action=install"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><label>Admin username</label><input class="input" name="username" value="admin" readonly><label>Password</label><input class="input" type="password" name="password" minlength="8" required><button class="btn primary w">Initialize panel</button></form><div class="hint">PHP 8.1+ · native JSON storage · no Composer</div></div></div></body></html><?php return (string)ob_get_clean(); }
+function css(): string { return '<style>
+:root{--bg:#080c16;--panel:#0d1424;--panel2:#111a2d;--line:#202b41;--text:#ecf2ff;--muted:#8b98b4;--blue:#5b8cff;--green:#31d17c;--red:#ff5d73;--amber:#f5b94b}*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;background:linear-gradient(135deg,#070b13,#0b1120 55%,#09111d);color:var(--text);min-height:100vh}a{color:inherit;text-decoration:none}.center{min-height:100vh;display:grid;place-items:center;padding:24px}.card,.panel{background:rgba(13,20,36,.88);border:1px solid var(--line);border-radius:18px;box-shadow:0 18px 60px #0005}.auth{width:min(420px,100%);padding:30px}.brand{font-size:26px;font-weight:800;letter-spacing:-.04em;margin-bottom:7px}.brand span{color:#78a0ff}.muted{color:var(--muted)}.hint{color:var(--muted);font-size:12px;margin-top:18px}.input,textarea,select{width:100%;background:#0a101d;color:var(--text);border:1px solid var(--line);padding:11px 12px;border-radius:11px;outline:none;font:inherit}.input:focus,textarea:focus,select:focus{border-color:#5078d8;box-shadow:0 0 0 3px #5078d81c}label{display:block;font-size:12px;color:var(--muted);margin:16px 0 7px}.btn{border:1px solid var(--line);background:#111a2d;color:var(--text);padding:10px 14px;border-radius:10px;font-weight:700;cursor:pointer}.btn:hover{filter:brightness(1.15)}.primary{background:var(--blue);border-color:#6c96ff;color:white}.danger{background:#3a1720;border-color:#622331;color:#ffb4bf}.success{background:#113020;border-color:#205e3b;color:#9ff0bf}.w{width:100%;margin-top:18px}.layout{display:grid;grid-template-columns:270px minmax(0,1fr);min-height:100vh}.side{border-right:1px solid var(--line);padding:20px;background:#080d17}.side .brand{margin-bottom:22px}.newbox{padding:14px;background:#0d1424;border:1px solid var(--line);border-radius:14px}.main{padding:22px;max-width:1600px;width:100%;margin:auto}.top{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-bottom:20px}.toolbar{display:flex;gap:9px;flex-wrap:wrap}.serverItem{display:block;padding:12px;border:1px solid transparent;border-radius:13px;margin:5px 0}.serverItem:hover,.serverItem.sel{background:#10192b;border-color:var(--line)}.serverName{font-weight:750}.status{display:inline-flex;align-items:center;gap:7px;color:var(--muted);font-size:12px;margin-top:5px}.dot{width:7px;height:7px;border-radius:50%;background:#65718a}.dot.run{background:var(--green);box-shadow:0 0 12px #31d17c}.grid{display:grid;grid-template-columns:1.2fr .8fr;gap:18px}.panel{padding:18px}.panel h3{margin:0 0 13px;font-size:14px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{padding:14px;background:#0a111f;border:1px solid var(--line);border-radius:13px}.stat b{display:block;font-size:22px;margin-top:4px}.k{font-size:11px;color:var(--muted)}.console{height:360px;overflow:auto;background:#05080f;border:1px solid #131c2d;border-radius:12px;padding:14px;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#bfd0ee}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.files{width:100%;border-collapse:collapse}.files td,.files th{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}.files th{color:var(--muted);font-weight:600}.chip{display:inline-block;border:1px solid var(--line);padding:2px 7px;border-radius:999px;font-size:10px;color:var(--muted)}.check{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-top:12px}.check input{accent-color:var(--blue)}@media(max-width:980px){.layout{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--line)}.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.main{padding:14px}}
+</style>'; }
+
+function files_html(array $s): string {
+    $root=server_dir($s); @mkdir($root,0775,true); $entries=scandir($root)?:[]; $rows='';
+    foreach($entries as $e){if($e==='.'||$e==='..')continue;$p=$root.'/'.$e;$rel=$e;$isDir=is_dir($p);$size=$isDir?'—':number_format((int)filesize($p)/1024,1).' KB';
+        $rows.='<tr><td>'.($isDir?'📁 ':'📄 ').'<a href="?server='.urlencode($s['slug']).($isDir?'':'&file='.urlencode($rel)).'">'.h($e).'</a></td><td>'.$size.'</td><td><form method="post" action="?action=file_delete" onsubmit="return confirm(\'Delete this item?\')"><input type="hidden" name="csrf" value="'.h(csrf()).'"><input type="hidden" name="id" value="'.(int)$s['id'].'"><input type="hidden" name="path" value="'.h($rel).'"><button class="btn danger" style="padding:6px 9px">Delete</button></form></td></tr>';
+    }
+    return '<table class="files"><thead><tr><th>Name</th><th>Size</th><th></th></tr></thead><tbody>'.$rows.'</tbody></table>';
+}
+
+function main_page(array $servers, ?array $selected, string $fileRel, string $editing): string { ob_start(); $csrf=csrf(); $sys=sysinfo(); ?>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?=h(APP_NAME)?></title><?=css()?></head><body>
+<div class="layout"><aside class="side"><div class="brand">Milo<span>Panel</span></div><div class="muted" style="font-size:12px;margin-bottom:12px">Standalone control plane</div>
+<div class="newbox"><form method="post" action="?action=create"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><label style="margin-top:0">Server name</label><input class="input" name="name" placeholder="My Server" required><label>Start command</label><input class="input" name="command" placeholder="php -S 0.0.0.0:3000" required><label class="check"><input type="checkbox" name="autostart"> Auto start</label><button class="btn primary w" style="margin-top:12px">Create server</button></form></div>
+<div style="margin-top:18px"><?php foreach($servers as $s):$run=status_of($s)==='running'; ?><a class="serverItem <?=($selected&&$selected['id']===$s['id'])?'sel':''?>" href="?server=<?=urlencode($s['slug'])?>"><div class="serverName"><?=h($s['name'])?></div><div class="status"><span class="dot <?=$run?'run':''?>"></span><?=$run?'Running':'Offline'?></div></a><?php endforeach;?></div>
+<div style="position:fixed;bottom:18px"><a class="muted" style="font-size:12px" href="?action=logout">Log out</a></div></aside>
+<main class="main"><div class="top"><div><h1 style="margin:0;font-size:25px">Dashboard</h1><div class="muted" style="font-size:12px">PHP <?=h(PHP_VERSION)?> · <?=h(PHP_OS_FAMILY)?> · <?=h(php_uname('m'))?></div></div><div class="toolbar"><a class="btn" href="?api=system" target="_blank">System API</a><?php if($selected):?><form method="post" action="?action=toggle" style="display:inline"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="id" value="<?=h((string)$selected['id'])?>"><button class="btn <?=status_of($selected)==='running'?'danger':'success'?>"><?=status_of($selected)==='running'?'Stop':'Start'?></button></form><form method="post" action="?action=restart" style="display:inline"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="id" value="<?=h((string)$selected['id'])?>"><button class="btn">Restart</button></form><?php endif;?></div></div>
+<?php if(!$selected):?><div class="panel"><h3>No servers yet</h3><p class="muted">Create one from the left. The panel creates its directory automatically.</p></div><?php else:$run=status_of($selected)==='running'; $log=tail_log(log_file($selected),16000); $dir=server_dir($selected); ?>
+<div class="stats"><div class="stat"><div class="k">Server</div><b><?=h($selected['name'])?></b></div><div class="stat"><div class="k">Status</div><b style="color:<?=$run?'var(--green)':'var(--muted)'?>"><?=$run?'RUNNING':'OFFLINE'?></b></div><div class="stat"><div class="k">PID</div><b><?=proc_pid($selected)?:'—'?></b></div><div class="stat"><div class="k">Storage</div><b><?=h($selected['slug'])?></b></div></div>
+<div class="grid" style="margin-top:18px"><section class="panel"><h3>Console / live log</h3><div id="console" class="console"><?=h($log ?: 'No output yet.')?></div><div class="toolbar" style="margin-top:10px"><button class="btn" onclick="copyLog()">Copy log</button><button class="btn" onclick="refreshLog()">Refresh</button></div></section><section class="panel"><h3>Server configuration</h3><form method="post" action="?action=save_server"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="id" value="<?=h((string)$selected['id'])?>"><label>Name</label><input class="input" name="name" value="<?=h($selected['name'])?>"><label>Command</label><textarea class="input" name="command" rows="3"><?=h($selected['command'])?></textarea><label>Working directory</label><input class="input" name="cwd" value="<?=h($selected['cwd'])?>"><label class="check"><input type="checkbox" name="autostart" <?=$selected['autostart']?'checked':''?>> Auto start</label><button class="btn primary" style="margin-top:14px">Save configuration</button></form><form method="post" action="?action=delete" onsubmit="return confirm('Delete server and ALL its files?')" style="margin-top:9px"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="id" value="<?=h((string)$selected['id'])?>"><button class="btn danger">Delete server</button></form></section></div>
+<section class="panel" style="margin-top:18px"><h3>File manager</h3><?=files_html($selected)?></section>
+<?php if($fileRel!==''): ?><section class="panel" style="margin-top:18px"><h3>Edit: <?=h($fileRel)?></h3><form method="post" action="?action=file_write"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="id" value="<?=h((string)$selected['id'])?>"><input type="hidden" name="path" value="<?=h($fileRel)?>"><textarea class="input" name="content" rows="20" style="font-family:ui-monospace,monospace"><?=h($editing)?></textarea><button class="btn primary" style="margin-top:10px">Save file</button></form></section><?php endif; ?>
+<section class="panel" style="margin-top:18px"><h3>Host telemetry</h3><div class="muted" style="font-size:12px">Load <?=h((string)$sys['load'])?> · RAM <?=h($sys['ram_total']?format_bytes((int)($sys['ram_total']-$sys['ram_free'])).' / '.format_bytes((int)$sys['ram_total']):'n/a')?> · Disk <?=h($sys['disk_total'] ? (format_bytes((int)($sys['disk_total']-$sys['disk_free'])) . ' / ' . format_bytes((int)$sys['disk_total'])) : 'n/a')?></div></section>
+<?php endif; ?></main></div>
+<script>
+const serverId=<?=$selected?(int)$selected['id']:'null'?>;
+async function refreshLog(){if(!serverId)return;try{const r=await fetch('?api=log&id='+serverId,{cache:'no-store'});const j=await r.json();document.getElementById('console').textContent=j.log||'No output yet.';const c=document.getElementById('console');c.scrollTop=c.scrollHeight}catch(e){}}
+function copyLog(){navigator.clipboard?.writeText(document.getElementById('console').textContent)}
+if(serverId){setInterval(refreshLog,2500);}
+</script></body></html><?php return (string)ob_get_clean(); }
+function format_bytes(int $n): string { $u=['B','KB','MB','GB','TB'];$i=0;(float)$n;while($n>=1024&&$i<count($u)-1){$n=(int)round($n/1024);$i++;}return $n.' '.$u[$i]; }
+echo main_page($servers,$selected,$fileRel,$editing);
+?>

@@ -1,0 +1,582 @@
+<?php
+declare(strict_types=1);
+
+// MiloPanel — standalone PHP game/application server panel.
+// Requirements: PHP 8.1+. POSIX shell is used for Linux/Termux process controls.
+// No Composer, Node, MySQL, Redis, Docker, or systemd required.
+
+session_name('milopanel');
+session_start();
+
+const APP_NAME = 'MiloPanel';
+const STORAGE_DIR = __DIR__ . '/servers';
+const LOG_DIR = __DIR__ . '/logs';
+const MAX_LOG_BYTES = 1024 * 1024 * 4;
+
+@mkdir(__DIR__ . '/data', 0775, true);
+@mkdir(STORAGE_DIR, 0775, true);
+@mkdir(LOG_DIR, 0775, true);
+
+function store_read(string $file, array $default=[]): array {
+    if (!is_file($file)) return $default;
+    $raw = @file_get_contents($file);
+    if ($raw === false || trim($raw)==='') return $default;
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : $default;
+}
+function store_write(string $file, array $data): void {
+    $tmp = $file.'.tmp';
+    file_put_contents($tmp, json_encode($data, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES), LOCK_EX);
+    rename($tmp, $file);
+}
+function settings(): array { static $x=null; if($x===null){$x=store_read(__DIR__.'/data/settings.json',[]);} return $x; }
+function save_settings(array $x): void { store_write(__DIR__.'/data/settings.json',$x); }
+function servers_store(): array { static $x=null; if($x===null){$x=store_read(__DIR__.'/data/servers.json',[]);} return $x; }
+function save_servers_store(array $x): void { store_write(__DIR__.'/data/servers.json',$x); }
+
+function setting(string $key, ?string $default = null): ?string {
+    $x=settings(); return array_key_exists($key,$x) ? (string)$x[$key] : $default;
+}
+function set_setting(string $key, string $value): void {
+    $x=settings(); $x[$key]=$value; save_settings($x);
+}
+
+function is_installed(): bool { return setting('admin_hash') !== null; }
+function logged_in(): bool { return isset($_SESSION['uid']) && $_SESSION['uid'] === 'admin'; }
+function csrf(): string { if (!isset($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(24)); return $_SESSION['csrf']; }
+function check_csrf(): void { if (!hash_equals((string)($_SESSION['csrf'] ?? ''), (string)($_POST['csrf'] ?? ''))) fail('Invalid CSRF token', 403); }
+function fail(string $msg, int $code=400): never { http_response_code($code); if (wants_json()) { header('Content-Type: application/json'); echo json_encode(['ok'=>false,'error'=>$msg], JSON_UNESCAPED_SLASHES); exit; } echo '<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;padding:40px;background:#09090b;color:#fafafa"><h2>Request failed</h2><p>'.h($msg).'</p><p><a style="color:#3b82f6" href="./">Back</a></p></body>'; exit; }
+function wants_json(): bool { return isset($_GET['api']) || str_starts_with($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json'); }
+function json_out(array $data): never { header('Content-Type: application/json; charset=utf-8'); echo json_encode($data, JSON_UNESCAPED_SLASHES); exit; }
+function h(string $s): string { return htmlspecialchars($s, ENT_QUOTES, 'UTF-8'); }
+function now(): string { return date('c'); }
+function slug(string $s): string { $s = strtolower(trim($s)); $s = preg_replace('/[^a-z0-9]+/', '-', $s) ?? ''; return trim($s, '-') ?: 'server'; }
+function all_servers(): array { return array_values(servers_store()); }
+function save_server(array $s): void { $x=servers_store(); $x[(string)$s['id']]=$s; save_servers_store($x); }
+function server_row(int $id): array { $x=servers_store(); $s=$x[(string)$id]??null; if(!$s) fail('Server not found',404); return $s; }
+
+function server_dir(array $s): string { return STORAGE_DIR . '/' . $s['slug']; }
+function log_file(array $s): string { return LOG_DIR . '/' . $s['slug'] . '.log'; }
+function pid_file(array $s): string { return LOG_DIR . '/' . $s['slug'] . '.pid'; }
+function proc_pid(array $s): ?int {
+    $f=pid_file($s); if (!is_file($f)) return null; $p=(int)trim((string)@file_get_contents($f)); return $p>0 ? $p : null;
+}
+function process_alive(?int $pid): bool {
+    if (!$pid) return false;
+    if (DIRECTORY_SEPARATOR === '\\') { @exec('tasklist /FI "PID eq '.(int)$pid.'" 2>NUL', $o, $rc); return $rc===0 && count($o)>1; }
+    if (function_exists('posix_kill')) return @posix_kill($pid, 0);
+    @exec('kill -0 '.(int)$pid.' 2>/dev/null', $o, $rc); return $rc===0;
+}
+function status_of(array $s): string { return process_alive(proc_pid($s)) ? 'running' : 'offline'; }
+function safe_join(string $base, string $rel): string {
+    $rel = str_replace('\\','/',$rel); $rel = ltrim($rel,'/');
+    if ($rel === '' || $rel === '.') return rtrim($base,'/');
+    foreach (explode('/',$rel) as $part) { if ($part === '..') fail('Path traversal denied',403); }
+    $full = rtrim($base,'/') . '/' . $rel;
+    $realBase = realpath($base);
+    if ($realBase === false) fail('Storage missing',500);
+    $parent = realpath(dirname($full));
+    if ($parent !== false && !str_starts_with($parent, $realBase)) fail('Path outside server root',403);
+    $candidate = $full;
+    if (file_exists($candidate)) { $real=realpath($candidate); if ($real===false || !str_starts_with($real,$realBase)) fail('Path outside server root',403); }
+    return $candidate;
+}
+function tail_log(string $file, int $bytes=12000): string { if (!is_file($file)) return ''; $size=(int)filesize($file); $fh=fopen($file,'rb'); if(!$fh) return ''; fseek($fh, max(0,$size-$bytes)); $txt=stream_get_contents($fh) ?: ''; fclose($fh); return $txt; }
+function shell_start(array $s): void {
+    $dir=server_dir($s); @mkdir($dir,0775,true);
+    $log=log_file($s); @touch($log);
+    if (status_of($s)==='running') return;
+    $cmd=$s['command'];
+    if (DIRECTORY_SEPARATOR === '\\') {
+        $wrapped = 'cd /d "'.str_replace('"','\\"',$dir).'" && '.$cmd.' >> "'.$log.'" 2>&1';
+        pclose(popen('start /B cmd /C "'.$wrapped.'"','r'));
+        sleep(1); 
+        return;
+    }
+    $cwd = preg_replace("/[\r\n]+/", ' ', $s['cwd']);
+    $cmd = 'cd '.escapeshellarg($cwd).' && exec '.$cmd;
+    $wrapper = 'sh -c '.escapeshellarg($cmd).' >> '.escapeshellarg($log).' 2>&1 & echo $!';
+    $pid = trim((string)shell_exec($wrapper));
+    if ($pid !== '' && ctype_digit($pid)) file_put_contents(pid_file($s), $pid, LOCK_EX);
+}
+function shell_stop(array $s): void {
+    $pid=proc_pid($s); if(!$pid) return;
+    if (DIRECTORY_SEPARATOR === '\\') { @exec('taskkill /PID '.(int)$pid.' /T /F'); }
+    else { @exec('kill -TERM '.(int)$pid.' 2>/dev/null'); usleep(300000); if(process_alive($pid)) @exec('kill -KILL '.(int)$pid.' 2>/dev/null'); }
+    @unlink(pid_file($s));
+}
+function restart_server(array $s): void { shell_stop($s); usleep(250000); shell_start($s); }
+function sysinfo(): array {
+    $load = function_exists('sys_getloadavg') ? sys_getloadavg() : [0,0,0];
+    $free = $total = null;
+    if (is_file('/proc/meminfo')) {
+        $m=file('/proc/meminfo', FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES);
+        foreach($m as $line){ if(preg_match('/^MemTotal:\s+(\d+)/',$line,$x))$total=(int)$x[1]*1024; if(preg_match('/^MemAvailable:\s+(\d+)/',$line,$x))$free=(int)$x[1]*1024; }
+    }
+    $disk = @disk_free_space(__DIR__); $diskTotal=@disk_total_space(__DIR__);
+    return ['php'=>PHP_VERSION,'os'=>PHP_OS_FAMILY,'arch'=>php_uname('m'),'load'=>round((float)$load[0],2),'ram_free'=>$free,'ram_total'=>$total,'disk_free'=>$disk?:null,'disk_total'=>$diskTotal?:null];
+}
+function rrmdir(string $dir): void { if(!is_dir($dir))return; $items=scandir($dir)?:[];foreach($items as $i){if($i==='.'||$i==='..')continue;$p=$dir.'/'.$i;if(is_dir($p)&&!is_link($p))rrmdir($p);else @unlink($p);} @rmdir($dir); }
+function format_bytes(int $n): string { $u=['B','KB','MB','GB','TB'];$i=0;(float)$n;while($n>=1024&&$i<count($u)-1){$n=(int)round($n/1024);$i++;}return $n.' '.$u[$i]; }
+
+// ---------------------------------------------------------
+// API / Actions
+// ---------------------------------------------------------
+$action = $_GET['action'] ?? '';
+if ($action === 'install') {
+    if (is_installed()) { header('Location: ./', true, 302); exit; }
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $user = trim((string)($_POST['username'] ?? ''));
+        $pass = (string)($_POST['password'] ?? '');
+        if ($user !== 'admin') fail('Username awal harus admin');
+        if (strlen($pass) < 8) fail('Password minimal 8 karakter');
+        $dataDir = __DIR__ . '/data';
+        if (!is_dir($dataDir) && !mkdir($dataDir, 0775, true)) fail('Tidak bisa membuat folder data', 500);
+        $hash = password_hash($pass, PASSWORD_DEFAULT);
+        if ($hash === false) fail('Gagal membuat password hash', 500);
+        save_settings(['admin_hash' => $hash, 'created_at' => now()]);
+        session_regenerate_id(true); $_SESSION['uid'] = 'admin'; $_SESSION['csrf'] = bin2hex(random_bytes(24)); session_write_close();
+        header('Location: ./', true, 302); exit;
+    }
+    echo install_page(); exit;
+}
+if (!is_installed()) { header('Location: ?action=install'); exit; }
+if ($action === 'login' && $_SERVER['REQUEST_METHOD']==='POST') {
+    $p=(string)($_POST['password']??''); if (password_verify($p,(string)setting('admin_hash'))) { $_SESSION['uid']='admin'; csrf(); header('Location: ./'); exit; } fail('Invalid password',401);
+}
+if ($action === 'logout') { session_destroy(); header('Location: ./'); exit; }
+if (!logged_in()) { echo login_page(); exit; }
+
+// Download file handler (No CSRF needed for simple GET download, but requires login)
+if ($action === 'file_download') {
+    $s = server_row((int)$_GET['id']);
+    $p = safe_join(server_dir($s), (string)$_GET['path']);
+    if (is_file($p)) {
+        header('Content-Description: File Transfer');
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="'.basename($p).'"');
+        header('Expires: 0');
+        header('Cache-Control: must-revalidate');
+        header('Pragma: public');
+        header('Content-Length: ' . filesize($p));
+        readfile($p);
+        exit;
+    }
+    fail('File not found', 404);
+}
+
+// Actions requiring CSRF
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (in_array($action, ['create','delete','toggle','restart','save_server','file_write','file_delete','file_upload','create_item','clear_log'])) check_csrf();
+
+    if ($action === 'create') {
+        $name=trim((string)($_POST['name']??'')); $cmd=trim((string)($_POST['command']??''));
+        if ($name===''||$cmd==='') fail('Name and command are required');
+        $slug=slug($name); $base=$slug; $n=2; $existing=array_map(fn($x)=>(string)$x['slug'], all_servers()); while(in_array($slug,$existing,true)) $slug=$base.'-'.($n++);
+        $list=servers_store(); $id=1; if($list){$ids=array_map('intval',array_keys($list));$id=max($ids)+1;}
+        $cwd=STORAGE_DIR.'/'.$slug; @mkdir($cwd,0775,true);
+        $server=['id'=>$id,'name'=>$name,'slug'=>$slug,'command'=>$cmd,'cwd'=>$cwd,'autostart'=>!empty($_POST['autostart'])?1:0,'created_at'=>now(),'updated_at'=>now()];
+        $list[(string)$id]=$server; save_servers_store($list);
+        header('Location: ?server='.urlencode($slug)); exit;
+    }
+    if ($action === 'delete') {
+        $s=server_row((int)$_POST['id']); shell_stop($s); $list=servers_store(); unset($list[(string)$s['id']]); save_servers_store($list); rrmdir(server_dir($s)); @unlink(log_file($s)); @unlink(pid_file($s)); header('Location: ./'); exit;
+    }
+    if ($action === 'toggle') {
+        $s=server_row((int)$_POST['id']); if(status_of($s)==='running') shell_stop($s); else shell_start($s); header('Location: ?server='.urlencode($s['slug'])); exit;
+    }
+    if ($action === 'restart') {
+        $s=server_row((int)$_POST['id']); restart_server($s); header('Location: ?server='.urlencode($s['slug'])); exit;
+    }
+    if ($action === 'clear_log') {
+        $s=server_row((int)$_POST['id']); @file_put_contents(log_file($s), ''); header('Location: ?server='.urlencode($s['slug'])); exit;
+    }
+    if ($action === 'save_server') {
+        $s=server_row((int)$_POST['id']); $name=trim((string)$_POST['name']);$cmd=trim((string)$_POST['command']);$cwd=trim((string)$_POST['cwd']); if($name===''||$cmd===''||$cwd==='') fail('Fields cannot be empty'); $s['name']=$name;$s['command']=$cmd;$s['cwd']=$cwd;$s['autostart']=!empty($_POST['autostart'])?1:0;$s['updated_at']=now();save_server($s); header('Location: ?server='.urlencode($s['slug'])); exit;
+    }
+    if ($action === 'file_write') {
+        $s=server_row((int)$_POST['id']);$rel=(string)$_POST['path'];$content=(string)$_POST['content'];$p=safe_join(server_dir($s),$rel); if(strlen($content)>3_000_000)fail('File too large'); @mkdir(dirname($p),0775,true);file_put_contents($p,$content,LOCK_EX);header('Location: ?server='.urlencode($s['slug']).'&file='.urlencode($rel));exit;
+    }
+    if ($action === 'file_delete') {
+        $s=server_row((int)$_POST['id']);$rel=(string)$_POST['path']; $p=safe_join(server_dir($s),$rel); if($p===server_dir($s))fail('Cannot delete server root'); if(is_dir($p))rrmdir($p); else @unlink($p); $dir=dirname($rel); if($dir==='.')$dir=''; header('Location: ?server='.urlencode($s['slug']).'&dir='.urlencode($dir));exit;
+    }
+    if ($action === 'file_upload') {
+        $s=server_row((int)$_POST['id']); $rel=(string)$_POST['dir']; $targetDir = safe_join(server_dir($s), $rel);
+        if (!is_dir($targetDir)) @mkdir($targetDir, 0775, true);
+        if (isset($_FILES['file']) && $_FILES['file']['error'] === UPLOAD_ERR_OK) {
+            $name = basename($_FILES['file']['name']); move_uploaded_file($_FILES['file']['tmp_name'], $targetDir . '/' . $name);
+        }
+        header('Location: ?server='.urlencode($s['slug']).'&dir='.urlencode($rel)); exit;
+    }
+    if ($action === 'create_item') {
+        $s=server_row((int)$_POST['id']); $rel=(string)$_POST['dir']; $name=trim((string)$_POST['name']); $type=(string)$_POST['type'];
+        if ($name !== '') {
+            $target = safe_join(server_dir($s), ltrim($rel . '/' . $name, '/'));
+            if ($type === 'dir') @mkdir($target, 0775, true); else @touch($target);
+        }
+        header('Location: ?server='.urlencode($s['slug']).'&dir='.urlencode($rel)); exit;
+    }
+}
+
+if (isset($_GET['api'])) {
+    switch ($_GET['api']) {
+        case 'servers': json_out(['ok'=>true,'servers'=>array_map(function($s){$s['status']=status_of($s);$s['pid']=proc_pid($s);return $s;},array_reverse(all_servers()))]);
+        case 'status': $id=(int)($_GET['id']??0);$s=server_row($id);json_out(['ok'=>true,'server'=>$s,'status'=>status_of($s),'pid'=>proc_pid($s),'log'=>tail_log(log_file($s),16000),'system'=>sysinfo()]);
+        case 'log': $id=(int)($_GET['id']??0);$s=server_row($id);json_out(['ok'=>true,'status'=>status_of($s),'log'=>tail_log(log_file($s),20000)]);
+        case 'system': json_out(['ok'=>true,'system'=>sysinfo()]);
+        default: json_out(['ok'=>false,'error'=>'Unknown API'],404);
+    }
+}
+
+// Autostart Check
+foreach (all_servers() as $as) { if (!empty($as['autostart']) && status_of($as) !== 'running') { @shell_start($as); } }
+
+$servers=array_reverse(all_servers());
+$selected=null; $serverSlug=(string)($_GET['server']??''); if($serverSlug!==''){ foreach($servers as $sv){ if($sv['slug']===$serverSlug){$selected=$sv;break;} } }
+if (!$selected && $servers) $selected=$servers[0];
+$fileRel=(string)($_GET['file']??''); $editing='';
+$dirRel=(string)($_GET['dir']??'');
+if($selected&&$fileRel!==''){ $p=safe_join(server_dir($selected),$fileRel); if(is_file($p)){ $editing=(string)@file_get_contents($p); } }
+
+// ---------------------------------------------------------
+// UI Functions & Components
+// ---------------------------------------------------------
+
+function icon(string $name): string {
+    $icons = [
+        'server' => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6.01" y2="6"></line><line x1="6" y1="18" x2="6.01" y2="18"></line></svg>',
+        'play' => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>',
+        'stop' => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>',
+        'restart' => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>',
+        'folder' => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>',
+        'file' => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#a1a1aa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>',
+        'trash' => '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>',
+        'download' => '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>',
+        'upload' => '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>',
+        'plus' => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>',
+        'back' => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>',
+        'x' => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>',
+        'cpu' => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>'
+    ];
+    return $icons[$name] ?? '';
+}
+
+function css(): string { return '<style>
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
+:root {
+  --bg: #09090b; --surface: #18181b; --surface-hover: #27272a; --border: #27272a; --border-focus: #3f3f46;
+  --text: #fafafa; --text-muted: #a1a1aa;
+  --primary: #3b82f6; --primary-hover: #2563eb;
+  --danger: #ef4444; --danger-hover: #dc2828;
+  --success: #10b981; --success-hover: #059669;
+  --radius-lg: 12px; --radius-md: 8px; --radius-sm: 6px;
+  --shadow-sm: 0 1px 2px 0 rgba(0,0,0,0.05); --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: "Inter", system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.5; font-size: 14px; }
+a { color: inherit; text-decoration: none; transition: color 0.2s; }
+.text-primary { color: var(--primary); }
+.text-muted { color: var(--text-muted); }
+.center-screen { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-md); }
+.auth-box { width: min(400px, 100%); padding: 32px; }
+.brand { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; display: flex; align-items: center; gap: 8px; }
+.brand span { color: var(--primary); }
+.input { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 10px 12px; border-radius: var(--radius-md); font-family: inherit; font-size: 14px; transition: border-color 0.2s, box-shadow 0.2s; }
+.input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(59,130,246,0.2); }
+textarea.input { resize: vertical; min-height: 80px; }
+label { display: block; font-size: 13px; font-weight: 500; color: var(--text-muted); margin: 16px 0 6px; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 8px 14px; border-radius: var(--radius-md); font-weight: 500; font-size: 13px; cursor: pointer; transition: all 0.2s; text-decoration: none; }
+.btn:hover { background: var(--surface-hover); border-color: var(--border-focus); }
+.btn.primary { background: var(--primary); border-color: var(--primary); color: white; }
+.btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+.btn.danger { background: rgba(239,68,68,0.1); border-color: rgba(239,68,68,0.2); color: var(--danger); }
+.btn.danger:hover { background: rgba(239,68,68,0.2); }
+.btn.success { background: rgba(16,185,129,0.1); border-color: rgba(16,185,129,0.2); color: var(--success); }
+.btn.success:hover { background: rgba(16,185,129,0.2); }
+.btn-sm { padding: 4px 8px; font-size: 12px; }
+.w-full { width: 100%; }
+.mt-4 { margin-top: 16px; } .mt-2 { margin-top: 8px; } .mb-4 { margin-bottom: 16px; }
+.layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: 100vh; }
+.sidebar { border-right: 1px solid var(--border); padding: 24px 16px; background: var(--bg); display: flex; flex-direction: column; }
+.sidebar-header { margin-bottom: 24px; padding: 0 8px; }
+.server-list { flex-grow: 1; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+.server-item { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: var(--radius-md); border: 1px solid transparent; transition: all 0.2s; }
+.server-item:hover, .server-item.active { background: var(--surface); border-color: var(--border); }
+.server-item .name { font-weight: 500; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+.status-dot.running { background: var(--success); box-shadow: 0 0 8px rgba(16,185,129,0.4); }
+.main-content { padding: 32px; max-width: 1400px; width: 100%; margin: 0 auto; }
+.header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; flex-wrap: wrap; gap: 16px; }
+.header h1 { font-size: 24px; font-weight: 600; }
+.toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 20px; margin-bottom: 24px; }
+.panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.panel-title { font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.grid-2 { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 24px; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px; display: flex; flex-direction: column; gap: 4px; }
+.stat-label { font-size: 12px; font-weight: 500; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.stat-value { font-size: 20px; font-weight: 600; }
+.console { height: 400px; overflow-y: auto; background: #000; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; color: #a1a1aa; white-space: pre-wrap; line-height: 1.6; }
+.table-container { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg); }
+.table { width: 100%; border-collapse: collapse; }
+.table th, .table td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
+.table th { font-weight: 500; color: var(--text-muted); background: var(--surface); }
+.table tr:last-child td { border-bottom: none; }
+.table tbody tr:hover { background: var(--surface-hover); }
+.file-name { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+.file-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.flex-row { display: flex; align-items: center; gap: 12px; }
+.progress-bar { width: 100%; height: 6px; background: var(--border); border-radius: 99px; overflow: hidden; margin-top: 6px; }
+.progress-fill { height: 100%; background: var(--primary); border-radius: 99px; }
+@media (max-width: 900px) { .layout { grid-template-columns: 1fr; } .sidebar { border-right: none; border-bottom: 1px solid var(--border); padding: 16px; } .grid-2 { grid-template-columns: 1fr; } .main-content { padding: 16px; } }
+</style>'; }
+
+function files_html(array $s, string $dirRel): string {
+    $base = server_dir($s);
+    $currentPath = safe_join($base, $dirRel);
+    if (!is_dir($currentPath)) $currentPath = $base;
+    
+    $entries = scandir($currentPath) ?: [];
+    $folders = []; $files = [];
+    foreach($entries as $e){
+        if($e==='.') continue;
+        if($e==='..' && $currentPath === $base) continue; // Don't allow going above root
+        
+        $p = $currentPath . '/' . $e;
+        $isDir = is_dir($p);
+        
+        if ($e === '..') {
+            $parentRel = dirname($dirRel);
+            if ($parentRel === '.') $parentRel = '';
+            $folders = array_merge([['name'=>'..', 'rel'=>$parentRel, 'is_dir'=>true, 'size'=>'—']], $folders);
+        } else {
+            $rel = ltrim($dirRel . '/' . $e, '/');
+            $item = ['name'=>$e, 'rel'=>$rel, 'is_dir'=>$isDir, 'size'=>$isDir ? '—' : format_bytes((int)filesize($p))];
+            if ($isDir) $folders[] = $item; else $files[] = $item;
+        }
+    }
+    
+    // Sort
+    usort($folders, fn($a,$b) => $a['name']==='..' ? -1 : strnatcasecmp($a['name'], $b['name']));
+    usort($files, fn($a,$b) => strnatcasecmp($a['name'], $b['name']));
+    $merged = array_merge($folders, $files);
+    
+    $rows = '';
+    foreach($merged as $item) {
+        $icon = $item['is_dir'] ? icon('folder') : icon('file');
+        $link = '?server='.urlencode($s['slug']).($item['is_dir'] ? '&dir='.urlencode($item['rel']) : '&file='.urlencode($item['rel']));
+        
+        $actions = '';
+        if ($item['name'] !== '..') {
+            if (!$item['is_dir']) {
+                $actions .= '<a href="?action=file_download&id='.(int)$s['id'].'&path='.urlencode($item['rel']).'" class="btn btn-sm" title="Download">'.icon('download').'</a>';
+            }
+            $actions .= '<form method="post" action="?action=file_delete" onsubmit="return confirm(\'Delete this item?\')" style="margin:0"><input type="hidden" name="csrf" value="'.h(csrf()).'"><input type="hidden" name="id" value="'.(int)$s['id'].'"><input type="hidden" name="path" value="'.h($item['rel']).'"><button class="btn danger btn-sm" title="Delete">'.icon('trash').'</button></form>';
+        }
+
+        $rows .= '<tr>
+            <td><a href="'.$link.'" class="file-name">'.$icon.h($item['name']).'</a></td>
+            <td class="text-muted">'.$item['size'].'</td>
+            <td><div class="file-actions">'.$actions.'</div></td>
+        </tr>';
+    }
+    if ($rows==='') $rows = '<tr><td colspan="3" class="text-muted" style="text-align:center">Directory is empty</td></tr>';
+
+    $csrf = h(csrf());
+    $sid = (int)$s['id'];
+    $encDir = h($dirRel);
+    
+    $toolbar = '
+    <div class="flex-row" style="margin-bottom:12px; flex-wrap:wrap; gap:16px;">
+        <form method="post" action="?action=file_upload" enctype="multipart/form-data" class="flex-row" style="gap:8px">
+            <input type="hidden" name="csrf" value="'.$csrf.'"><input type="hidden" name="id" value="'.$sid.'"><input type="hidden" name="dir" value="'.$encDir.'">
+            <input type="file" name="file" required class="input" style="padding:6px; max-width: 220px; font-size:12px">
+            <button class="btn" title="Upload File">'.icon('upload').' Upload</button>
+        </form>
+        <form method="post" action="?action=create_item" class="flex-row" style="gap:8px">
+            <input type="hidden" name="csrf" value="'.$csrf.'"><input type="hidden" name="id" value="'.$sid.'"><input type="hidden" name="dir" value="'.$encDir.'">
+            <select name="type" class="input" style="padding:7px; width:auto"><option value="file">File</option><option value="dir">Folder</option></select>
+            <input type="text" name="name" placeholder="Name..." required class="input" style="padding:7px; max-width: 140px">
+            <button class="btn">'.icon('plus').' Create</button>
+        </form>
+    </div>';
+
+    return $toolbar . '<div class="table-container"><table class="table"><thead><tr><th style="width:60%">Name</th><th>Size</th><th style="text-align:right">Actions</th></tr></thead><tbody>'.$rows.'</tbody></table></div>';
+}
+
+function login_page(): string { ob_start(); $csrf=csrf(); ?>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?=h(APP_NAME)?></title><?=css()?></head><body>
+<div class="center-screen"><div class="card auth-box"><div class="brand mb-4"><?=icon('server')?> Milo<span>Panel</span></div><p class="text-muted mb-4">Sign in to manage your servers</p>
+<form method="post" action="?action=login"><input type="hidden" name="csrf" value="<?=h($csrf)?>">
+<label>Password</label><input class="input" type="password" name="password" autofocus required>
+<button class="btn primary w-full mt-4" type="submit">Sign in</button></form>
+</div></div></body></html><?php return (string)ob_get_clean(); }
+
+function install_page(): string { ob_start(); $csrf=csrf(); ?>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Install <?=h(APP_NAME)?></title><?=css()?></head><body>
+<div class="center-screen"><div class="card auth-box"><div class="brand mb-4"><?=icon('server')?> Milo<span>Panel</span></div><h2 style="font-size:18px; margin-bottom:4px">First-run setup</h2><p class="text-muted mb-4" style="font-size:13px">Initialize the control panel.</p>
+<form method="post" action="?action=install"><input type="hidden" name="csrf" value="<?=h($csrf)?>">
+<label>Admin username</label><input class="input" name="username" value="admin" readonly>
+<label>Password</label><input class="input" type="password" name="password" minlength="8" required placeholder="Minimum 8 characters">
+<button class="btn primary w-full mt-4">Initialize Panel</button></form>
+<div class="text-muted mt-4" style="font-size:12px; text-align:center">PHP <?=PHP_VERSION?> &middot; Native JSON Storage</div>
+</div></div></body></html><?php return (string)ob_get_clean(); }
+
+function main_page(array $servers, ?array $selected, string $fileRel, string $dirRel, string $editing): string { ob_start(); $csrf=csrf(); $sys=sysinfo(); ?>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?=h(APP_NAME)?></title><?=css()?></head><body>
+<div class="layout">
+<aside class="sidebar">
+    <div class="sidebar-header">
+        <div class="brand"><?=icon('server')?> Milo<span>Panel</span></div>
+        <div class="text-muted mt-2" style="font-size:12px">PHP <?=h(PHP_VERSION)?> &middot; <?=h(PHP_OS_FAMILY)?></div>
+    </div>
+    
+    <div class="server-list">
+        <div style="padding: 0 8px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center">
+            <span class="text-muted" style="font-size:11px; font-weight:600; text-transform:uppercase">Your Servers</span>
+        </div>
+        <?php foreach($servers as $s): $run=status_of($s)==='running'; ?>
+        <a class="server-item <?=($selected&&$selected['id']===$s['id'])?'active':''?>" href="?server=<?=urlencode($s['slug'])?>">
+            <span class="name"><?=h($s['name'])?></span>
+            <span class="status-dot <?=$run?'running':''?>" title="<?=$run?'Running':'Offline'?>"></span>
+        </a>
+        <?php endforeach; if(empty($servers)): ?>
+        <div class="text-muted" style="padding:0 8px; font-size:13px">No servers found.</div>
+        <?php endif; ?>
+    </div>
+
+    <div style="margin-top:24px; padding: 0 8px;">
+        <form method="post" action="?action=create" class="card" style="padding:12px; background:var(--bg)">
+            <input type="hidden" name="csrf" value="<?=h($csrf)?>">
+            <div style="font-size:12px; font-weight:600; margin-bottom:8px">New Server</div>
+            <input class="input mb-2" style="padding:6px 10px; font-size:12px" name="name" placeholder="Name" required>
+            <input class="input mb-2" style="padding:6px 10px; font-size:12px" name="command" placeholder="Command (e.g. php -S ...)" required>
+            <label style="display:flex; align-items:center; gap:6px; margin:8px 0; font-size:12px; color:var(--text)"><input type="checkbox" name="autostart"> Auto start</label>
+            <button class="btn primary w-full btn-sm"><?=icon('plus')?> Create</button>
+        </form>
+    </div>
+    <div style="padding: 16px 8px 0; border-top:1px solid var(--border); margin-top:24px">
+        <a href="?action=logout" class="text-muted" style="font-size:13px; display:flex; gap:8px; align-items:center"><?=icon('x')?> Log out</a>
+    </div>
+</aside>
+
+<main class="main-content">
+<?php if(!$selected): ?>
+    <div class="center-screen" style="min-height:60vh; text-align:center">
+        <div style="color:var(--text-muted); margin-bottom:16px"><?=icon('server')?></div>
+        <h2>Welcome to MiloPanel</h2>
+        <p class="text-muted">Create a server from the sidebar to get started.</p>
+    </div>
+<?php else: 
+    $run=status_of($selected)==='running'; 
+    $log=tail_log(log_file($selected),16000);
+?>
+    <div class="header">
+        <div>
+            <h1><?=h($selected['name'])?></h1>
+            <div class="text-muted mt-2" style="font-size:13px; display:flex; align-items:center; gap:16px">
+                <span style="display:flex; align-items:center; gap:6px"><span class="status-dot <?=$run?'running':''?>"></span> <?=$run?'Running':'Offline'?></span>
+                <span>PID: <?=proc_pid($selected)?:'—'?></span>
+            </div>
+        </div>
+        <div class="toolbar">
+            <form method="post" action="?action=toggle" style="display:inline"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="id" value="<?=h((string)$selected['id'])?>"><button class="btn <?=$run?'danger':'success'?>"><?=$run?icon('stop').' Stop':icon('play').' Start'?></button></form>
+            <form method="post" action="?action=restart" style="display:inline"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="id" value="<?=h((string)$selected['id'])?>"><button class="btn"><?=icon('restart')?> Restart</button></form>
+        </div>
+    </div>
+
+    <!-- System Telemetry Widgets -->
+    <div class="stat-grid">
+        <div class="stat-card">
+            <span class="stat-label"><?=icon('cpu')?> CPU Load (1m)</span>
+            <span class="stat-value"><?=h((string)$sys['load'])?></span>
+        </div>
+        <div class="stat-card">
+            <span class="stat-label">RAM Usage</span>
+            <?php if($sys['ram_total']): $usedRam = $sys['ram_total']-$sys['ram_free']; $ramPct = min(100, round(($usedRam/$sys['ram_total'])*100)); ?>
+                <span class="stat-value"><?=format_bytes((int)$usedRam)?> <span class="text-muted" style="font-size:14px">/ <?=format_bytes((int)$sys['ram_total'])?></span></span>
+                <div class="progress-bar"><div class="progress-fill" style="width:<?=$ramPct?>%"></div></div>
+            <?php else: ?> <span class="stat-value">N/A</span> <?php endif; ?>
+        </div>
+        <div class="stat-card">
+            <span class="stat-label">Disk Storage</span>
+            <?php if($sys['disk_total']): $usedDisk = $sys['disk_total']-$sys['disk_free']; $diskPct = min(100, round(($usedDisk/$sys['disk_total'])*100)); ?>
+                <span class="stat-value"><?=format_bytes((int)$usedDisk)?> <span class="text-muted" style="font-size:14px">/ <?=format_bytes((int)$sys['disk_total'])?></span></span>
+                <div class="progress-bar"><div class="progress-fill" style="width:<?=$diskPct?>%"></div></div>
+            <?php else: ?> <span class="stat-value">N/A</span> <?php endif; ?>
+        </div>
+    </div>
+
+    <?php if($fileRel!==''): // Editor Mode ?>
+    <section class="panel">
+        <div class="panel-header">
+            <div class="panel-title"><?=icon('file')?> Edit: <?=h($fileRel)?></div>
+            <div class="toolbar">
+                <a href="?server=<?=urlencode($selected['slug'])?>&dir=<?=urlencode(dirname($fileRel)==='.'?'':dirname($fileRel))?>" class="btn"><?=icon('back')?> Close</a>
+                <a href="?action=file_download&id=<?=$selected['id']?>&path=<?=urlencode($fileRel)?>" class="btn"><?=icon('download')?> Download</a>
+            </div>
+        </div>
+        <form method="post" action="?action=file_write">
+            <input type="hidden" name="csrf" value="<?=h($csrf)?>">
+            <input type="hidden" name="id" value="<?=h((string)$selected['id'])?>">
+            <input type="hidden" name="path" value="<?=h($fileRel)?>">
+            <textarea class="input" name="content" rows="22" style="font-family:ui-monospace,SFMono-Regular,monospace; background:#000; font-size:13px; color:#e4e4e7" spellcheck="false"><?=h($editing)?></textarea>
+            <button class="btn primary mt-4"><?=icon('file')?> Save Changes</button>
+        </form>
+    </section>
+    <?php else: // Dashboard Mode ?>
+    
+    <div class="grid-2">
+        <!-- Live Console -->
+        <section class="panel">
+            <div class="panel-header">
+                <div class="panel-title"><?=icon('server')?> Console Output</div>
+                <div class="toolbar">
+                    <button class="btn btn-sm" onclick="copyLog()">Copy</button>
+                    <form method="post" action="?action=clear_log" style="display:inline"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="id" value="<?=h((string)$selected['id'])?>"><button class="btn danger btn-sm">Clear</button></form>
+                </div>
+            </div>
+            <div id="console" class="console"><?=h($log ?: 'No output yet.')?></div>
+        </section>
+        
+        <!-- Config -->
+        <section class="panel">
+            <div class="panel-header"><div class="panel-title">Configuration</div></div>
+            <form method="post" action="?action=save_server">
+                <input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="id" value="<?=h((string)$selected['id'])?>">
+                <label>Server Name</label><input class="input" name="name" value="<?=h($selected['name'])?>">
+                <label>Startup Command</label><textarea class="input" name="command" rows="3"><?=h($selected['command'])?></textarea>
+                <label>Working Directory (Root)</label><input class="input" name="cwd" value="<?=h($selected['cwd'])?>">
+                <label style="display:flex; align-items:center; gap:8px; margin-top:16px; color:var(--text)"><input type="checkbox" name="autostart" <?=$selected['autostart']?'checked':''?>> Start on panel boot</label>
+                <button class="btn primary mt-4 w-full">Save Configuration</button>
+            </form>
+            <hr style="border:0; border-top:1px solid var(--border); margin:24px 0">
+            <form method="post" action="?action=delete" onsubmit="return confirm('WARNING: This will delete the server and ALL its files. Continue?')">
+                <input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="id" value="<?=h((string)$selected['id'])?>">
+                <button class="btn danger w-full"><?=icon('trash')?> Delete Server</button>
+            </form>
+        </section>
+    </div>
+
+    <!-- File Manager -->
+    <section class="panel">
+        <div class="panel-header">
+            <div class="panel-title"><?=icon('folder')?> File Manager <span class="text-muted" style="font-size:13px; font-weight:normal">/<?=h($dirRel)?></span></div>
+        </div>
+        <?=files_html($selected, $dirRel)?>
+    </section>
+
+    <?php endif; ?>
+<?php endif; ?>
+</main>
+</div>
+<script>
+const serverId=<?=$selected?(int)$selected['id']:'null'?>;
+async function refreshLog(){if(!serverId)return;try{const r=await fetch('?api=log&id='+serverId,{cache:'no-store'});const j=await r.json();document.getElementById('console').textContent=j.log||'No output yet.';const c=document.getElementById('console');c.scrollTop=c.scrollHeight}catch(e){}}
+function copyLog(){navigator.clipboard?.writeText(document.getElementById('console').textContent); alert('Log copied to clipboard');}
+if(serverId && document.getElementById('console')){setInterval(refreshLog,2500); refreshLog();}
+</script></body></html><?php return (string)ob_get_clean(); }
+
+echo main_page($servers, $selected, $fileRel, $dirRel, $editing);
