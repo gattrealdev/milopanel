@@ -1,4 +1,4 @@
-# 🚀 MiloPanel
+#  MiloPanel
 
 > **A lightweight PHP control panel for managing Linux processes** — without Docker, Wings, database servers, or systemd.
 >
